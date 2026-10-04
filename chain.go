@@ -50,14 +50,3 @@ func (t *chainTree) ancestors(hash string) []*blockNode {
 	}
 	return out
 }
-
-// pruneBelow removes every node with number below height. It is used to bound
-// memory after a height becomes finalized: reverts below that point are no
-// longer possible, and state is recoverable from the durable checkpoint.
-func (t *chainTree) pruneBelow(height uint64) {
-	for hash, node := range t.nodes {
-		if node.number < height {
-			delete(t.nodes, hash)
-		}
-	}
-}

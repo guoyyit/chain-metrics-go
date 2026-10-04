@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"sort"
 )
 
 const (
@@ -106,11 +105,17 @@ func (s *Store) persistBlock(b Block) error {
 	if err := s.walWriter.WriteByte('\n'); err != nil {
 		return err
 	}
-	return s.walWriter.Flush()
+	if err := s.walWriter.Flush(); err != nil {
+		return err
+	}
+	// fsync so the record is durable before the head pointer is advanced.
+	return s.wal.Sync()
 }
 
-// truncateFrom rewrites the WAL keeping only blocks below fromHeight.
-func (s *Store) truncateFrom(fromHeight uint64) error {
+// rewriteWAL atomically rewrites the WAL keeping every record for which keep
+// returns true. The new file is fsynced and swapped in via rename, so a crash
+// at any point leaves either the old or the new complete WAL on disk.
+func (s *Store) rewriteWAL(keep func(pb persistedBlock) bool) error {
 	if s.dir == "" {
 		return nil
 	}
@@ -131,7 +136,7 @@ func (s *Store) truncateFrom(fromHeight uint64) error {
 	}
 	w := bufio.NewWriter(tmp)
 	for _, pb := range blocks {
-		if pb.Number >= fromHeight {
+		if keep != nil && !keep(pb) {
 			continue
 		}
 		raw, err := json.Marshal(pb)
@@ -162,12 +167,36 @@ func (s *Store) truncateFrom(fromHeight uint64) error {
 	if err := os.Rename(tmp.Name(), filepath.Join(s.dir, walName)); err != nil {
 		return err
 	}
+	if err := syncDir(s.dir); err != nil {
+		return err
+	}
 	s.wal, err = os.OpenFile(filepath.Join(s.dir, walName), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
 	s.walWriter = bufio.NewWriter(s.wal)
 	return nil
+}
+
+// syncDir fsyncs a directory so that a rename within it survives power loss.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// walBlocks returns all decoded WAL records (torn trailing record dropped).
+func (s *Store) walBlocks() ([]persistedBlock, error) {
+	if s.dir == "" {
+		return nil, nil
+	}
+	return s.readWAL()
 }
 
 // saveHead durably records the canonical tip via temp-file + atomic rename.
@@ -194,7 +223,10 @@ func (s *Store) saveHead(number uint64, hash string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), filepath.Join(s.dir, headName))
+	if err := os.Rename(tmp.Name(), filepath.Join(s.dir, headName)); err != nil {
+		return err
+	}
+	return syncDir(s.dir)
 }
 
 // loadHead returns the durable canonical tip; ok=false when never committed.
@@ -236,7 +268,10 @@ func (s *Store) saveCheckpoint(raw []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), filepath.Join(s.dir, checkpointFile))
+	if err := os.Rename(tmp.Name(), filepath.Join(s.dir, checkpointFile)); err != nil {
+		return err
+	}
+	return syncDir(s.dir)
 }
 
 // loadCheckpoint reads a persisted state image, if any.
@@ -249,52 +284,6 @@ func (s *Store) loadCheckpoint() ([]byte, error) {
 		return nil, nil
 	}
 	return raw, err
-}
-
-// loadCanonicalChain replays the WAL following the saved head's parent links.
-func (s *Store) loadCanonicalChain() ([]Block, error) {
-	if s.dir == "" {
-		return nil, nil
-	}
-	blocks, err := s.readWAL()
-	if err != nil {
-		return nil, err
-	}
-	byHash := make(map[string]*persistedBlock, len(blocks))
-	for i := range blocks {
-		byHash[blocks[i].Hash] = &blocks[i]
-	}
-	_, headHash, hasHead, err := s.loadHead()
-	if err != nil {
-		return nil, err
-	}
-	if !hasHead {
-		sort.Slice(blocks, func(i, j int) bool { return blocks[i].Number < blocks[j].Number })
-		out := make([]Block, 0, len(blocks))
-		for i := range blocks {
-			b, err := blocks[i].toBlock()
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, b)
-		}
-		return out, nil
-	}
-	var ordered []*persistedBlock
-	node := byHash[headHash]
-	for node != nil {
-		ordered = append(ordered, node)
-		node = byHash[node.ParentHash]
-	}
-	out := make([]Block, 0, len(ordered))
-	for i := len(ordered) - 1; i >= 0; i-- {
-		b, err := ordered[i].toBlock()
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, nil
 }
 
 // readWAL reads all durable block records; a torn trailing line is discarded.
@@ -343,4 +332,25 @@ func (pb *persistedBlock) toBlock() (Block, error) {
 		})
 	}
 	return b, nil
+}
+
+// blockToPersisted encodes a Block for durable storage.
+func blockToPersisted(b Block) persistedBlock {
+	pb := persistedBlock{
+		Number:     b.Number,
+		Hash:       b.Hash,
+		ParentHash: b.ParentHash,
+		Events:     make([]persistedEvent, 0, len(b.Events)),
+	}
+	for _, e := range b.Events {
+		pb.Events = append(pb.Events, persistedEvent{
+			TokenID: e.TokenID,
+			Type:    e.Type,
+			From:    e.From,
+			To:      e.To,
+			Amount:  e.Amount.String(),
+			Index:   e.Index,
+		})
+	}
+	return pb
 }

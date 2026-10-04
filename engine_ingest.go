@@ -63,19 +63,24 @@ func (e *Engine) PushBlock(b Block) error {
 	if e.chain.has(b.Hash) {
 		return nil
 	}
+	isGenesis := e.headHash == "" && (b.Number == 0 || b.ParentHash == "")
+	if !isGenesis && e.chain.get(b.ParentHash) == nil {
+		// Parent unknown: either an out-of-order intermediate or a fork whose
+		// base has already left the retained window. Buffer only blocks that
+		// could still become part of a supported reorganization.
+		if err := e.bufferOrRejectOrphan(b); err != nil {
+			return err
+		}
+		return nil
+	}
 	node, err := e.buildNode(b)
 	if err != nil {
-		// Parent unknown: buffer the block until its ancestor arrives.
-		if e.chain.get(b.ParentHash) == nil {
-			e.pendingBlocks[b.Hash] = b
-			return nil
-		}
 		return err
 	}
 	e.chain.add(node)
 
 	// Genesis or the direct next tip: activate immediately.
-	if e.headHash == "" && (b.Number == 0 || b.ParentHash == "") {
+	if isGenesis {
 		if err := e.activate(node); err != nil {
 			return err
 		}
@@ -87,23 +92,153 @@ func (e *Engine) PushBlock(b Block) error {
 		}
 		return e.flushPending()
 	}
-	// Otherwise it belongs to a fork (or arrived out of order); attempt a
-	// reorganization only if it connects to a known ancestor.
-	if e.chain.get(b.ParentHash) != nil {
-		if err := e.maybeReorgTo(node); err != nil {
-			return err
+	// Otherwise it belongs to a fork; the longest-chain rule and the rollback
+	// boundary are enforced inside considerNode.
+	if err := e.considerNode(node); err != nil {
+		return err
+	}
+	return e.flushPending()
+}
+
+// bufferOrRejectOrphan stores a parent-unknown block for later cascading when
+// its height could still participate in a supported reorganization. A block
+// whose height is already below the rollback limit can never connect to a
+// retained ancestor, so it is rejected with a distinguishable error instead
+// of being silently held forever.
+func (e *Engine) bufferOrRejectOrphan(b Block) error {
+	// Walk the known ancestry of b through the tree and already-buffered
+	// orphans to locate the eventual fork point. A block is buffered only when
+	// the partial branch reaches a retained ancestor (fork height >= rollback
+	// limit). A branch whose chain runs out below the limit -- even when its
+	// later blocks have high heights -- is rejected, because it can never
+	// produce a supported reorganization.
+	limit := e.rollbackLimit()
+	cursor := b
+	for {
+		if _, bad := e.unreachableParents[cursor.Hash]; bad {
+			return reorgTooDeepError(cursor.Number, limit, e.headNumber)
 		}
-	} else {
+		if _, bad := e.unreachableParents[cursor.ParentHash]; bad {
+			e.unreachableParents[cursor.Hash] = cursor.Number
+			return reorgTooDeepError(cursor.Number-1, limit, e.headNumber)
+		}
+		// A retained canonical ancestor within the rollback window makes the
+		// branch connectable. A retained *fork* node just continues the walk.
+		if parent := e.chain.get(cursor.ParentHash); parent != nil {
+			if e.isCanonical(parent.hash) {
+				if parent.number < limit {
+					e.unreachableParents[cursor.Hash] = cursor.Number
+					return reorgTooDeepError(parent.number, limit, e.headNumber)
+				}
+				e.pendingBlocks[b.Hash] = b
+				return nil
+			}
+			cursor = parent.block
+			continue
+		}
+		if parent, ok := e.pendingBlocks[cursor.ParentHash]; ok {
+			cursor = parent
+			continue
+		}
+		// The base of the known chain is this cursor; its missing parent is
+		// the effective fork point.
+		forkHeight := cursor.Number - 1
+		if forkHeight < limit {
+			e.unreachableParents[cursor.Hash] = cursor.Number
+			return reorgTooDeepError(forkHeight, limit, e.headNumber)
+		}
+		// Missing parent but the eventual fork would still be inside the
+		// window: a genuinely out-of-order intermediate block.
 		e.pendingBlocks[b.Hash] = b
 		return nil
 	}
-	return e.flushPending()
+}
+
+// isCanonical reports whether hash is an ancestor of (or is) the head.
+func (e *Engine) isCanonical(hash string) bool {
+	for n := e.chain.get(e.headHash); n != nil; n = e.chain.get(n.parentHash) {
+		if n.hash == hash {
+			return true
+		}
+	}
+	return false
+}
+
+// considerNode activates or reorganizes to a freshly connected node under the
+// longest-chain rule. Forks that fork below the supported rollback boundary
+// are rejected with ErrReorgTooDeep without touching any published state.
+func (e *Engine) considerNode(node *blockNode) error {
+	if e.headHash == "" {
+		return nil
+	}
+	// Direct canonical extension is handled by the caller before this point.
+	if node.number <= e.headNumber {
+		// Equal-height or shorter sibling: retain but do not activate.
+		return nil
+	}
+	fork, err := e.locateFork(node)
+	if err != nil {
+		return err
+	}
+	if fork == nil {
+		return ErrNoCommonAncestor
+	}
+	return e.reorgTo(node, fork)
+}
+
+// locateFork returns the common ancestor of node and the canonical head, or
+// an error when the fork point is outside the retained window.
+func (e *Engine) locateFork(node *blockNode) (*blockNode, error) {
+	limit := e.rollbackLimit()
+	headAncestors := make(map[string]bool)
+	for h := e.chain.get(e.headHash); h != nil; h = e.chain.get(h.parentHash) {
+		headAncestors[h.hash] = true
+	}
+	for n := node; n != nil; n = e.chain.get(n.parentHash) {
+		if headAncestors[n.hash] {
+			if n.number < limit {
+				return nil, reorgTooDeepError(n.number, limit, e.headNumber)
+			}
+			return n, nil
+		}
+	}
+	// The branch runs off the bottom of the retained tree. If its base height
+	// is already below the boundary the fork cannot possibly be supported.
+	base := node
+	for p := e.chain.get(base.parentHash); p != nil; p = e.chain.get(p.parentHash) {
+		base = p
+	}
+	if base.number < limit {
+		return nil, reorgTooDeepError(base.number-1, limit, e.headNumber)
+	}
+	return nil, ErrNoCommonAncestor
+}
+
+// effectiveFork walks the ancestry of a block (whose parent is known to be in
+// the tree) and returns the first ancestor that lies on the canonical chain,
+// or nil when the branch does not connect to a retained canonical node.
+func (e *Engine) effectiveFork(b Block) *blockNode {
+	headAncestors := make(map[string]bool)
+	for h := e.chain.get(e.headHash); h != nil; h = e.chain.get(h.parentHash) {
+		headAncestors[h.hash] = true
+	}
+	for n := e.chain.get(b.ParentHash); n != nil; n = e.chain.get(n.parentHash) {
+		if headAncestors[n.hash] {
+			return n
+		}
+	}
+	return nil
 }
 
 // flushPending activates buffered blocks whose parents have since arrived.
 func (e *Engine) flushPending() error {
 	for {
 		progress := false
+		type candidate struct {
+			hash string
+			b    Block
+		}
+		var ready []candidate
 		for hash, b := range e.pendingBlocks {
 			if e.chain.has(hash) {
 				delete(e.pendingBlocks, hash)
@@ -111,10 +246,28 @@ func (e *Engine) flushPending() error {
 				continue
 			}
 			if e.chain.get(b.ParentHash) == nil {
+				if b.Number < e.rollbackLimit() {
+					ready = append(ready, candidate{hash, b})
+				}
 				continue
 			}
+			ready = append(ready, candidate{hash, b})
+		}
+		for _, c := range ready {
+			hash, b := c.hash, c.b
 			delete(e.pendingBlocks, hash)
 			progress = true
+			if e.chain.get(b.ParentHash) == nil {
+				// Became unreachable through retention: reject explicitly.
+				return reorgTooDeepError(b.Number-1, e.rollbackLimit(), e.headNumber)
+			}
+			// The retained ancestor may be a finalized node below the rollback
+			// limit that was only discoverable now that intermediates joined:
+			// re-check the effective fork depth before building the branch.
+			if fork := e.effectiveFork(b); fork != nil && fork.number < e.rollbackLimit() {
+				e.unreachableParents[b.ParentHash] = fork.number
+				return reorgTooDeepError(fork.number, e.rollbackLimit(), e.headNumber)
+			}
 			node, err := e.buildNode(b)
 			if err != nil {
 				return err
@@ -126,14 +279,7 @@ func (e *Engine) flushPending() error {
 				}
 				continue
 			}
-			// The new node may now directly extend the freshly advanced tip.
-			if b.ParentHash == e.headHash && b.Number == e.headNumber+1 {
-				if err := e.activate(node); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := e.maybeReorgTo(node); err != nil {
+			if err := e.considerNode(node); err != nil {
 				return err
 			}
 		}

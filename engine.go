@@ -26,14 +26,34 @@ type Engine struct {
 	// pendingBlocks holds blocks whose parent is not yet known.
 	pendingBlocks map[string]Block
 
+	// unreachableParents records hashes of blocks whose ancestry is known to
+	// run below the rollback limit (already rejected), keyed by hash with the
+	// block height for bounded pruning. Descendants are rejected too instead
+	// of being buffered as out-of-order intermediates.
+	unreachableParents map[string]uint64
+
 	// snapshots by block height, bounded to HistoryBlocks.
 	snapshots map[uint64]Snapshot
 
 	headNumber uint64
 	headHash   string
 
-	// checkpointHeight is the block whose full state is durably snapshotted.
+	// checkpointHeight is the height captured by the durable state image.
+	// The image is always published at or below the finalized boundary
+	// (head minus HistoryBlocks), so every block the engine claims to support
+	// rollback to stays outside the image.
 	checkpointHeight uint64
+	checkpointHash   string
+
+	// envelopeHeights are block heights carried in the durable state image
+	// envelope (e.g. a deep-reorganization fork point). Their snapshots stay
+	// queryable even one height below the rolling retention window.
+	envelopeHeights map[uint64]bool
+
+	// crashHook, when set, is invoked at named points of the durable
+	// switch protocol and allows tests to stop right after a given disk write,
+	// emulating a crash in the middle of a reorganization.
+	crashHook func(point string) error
 }
 
 // NewEngine creates an engine and replays durable state when a data dir is set.
@@ -47,38 +67,17 @@ func NewEngine(cfg Config) (*Engine, error) {
 		return nil, err
 	}
 	e := &Engine{
-		cfg:           cfg,
-		store:         store,
-		chain:         newChainTree(),
-		pending:       make(map[uint64]map[string]map[string]map[uint32]Event),
-		pendingBlocks: make(map[string]Block),
-		snapshots:     make(map[uint64]Snapshot),
+		cfg:                cfg,
+		store:              store,
+		chain:              newChainTree(),
+		pending:            make(map[uint64]map[string]map[string]map[uint32]Event),
+		pendingBlocks:      make(map[string]Block),
+		unreachableParents: make(map[string]uint64),
+		envelopeHeights:    make(map[uint64]bool),
+		snapshots:          make(map[uint64]Snapshot),
 	}
-	cpRaw, err := store.loadCheckpoint()
-	if err != nil {
+	if err := e.recover(); err != nil {
 		return nil, err
-	}
-	if cpRaw != nil {
-		node, _, _, derr := decodeCheckpoint(cpRaw)
-		if derr != nil {
-			return nil, derr
-		}
-		e.chain.add(node)
-		e.publishNode(node)
-		e.checkpointHeight = node.number
-	}
-
-	blocks, err := store.loadCanonicalChain()
-	if err != nil {
-		return nil, err
-	}
-	for _, b := range blocks {
-		if e.headHash != "" && b.Number <= e.headNumber {
-			continue
-		}
-		if err := e.applyCanonical(b); err != nil {
-			return nil, err
-		}
 	}
 	return e, nil
 }
