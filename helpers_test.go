@@ -41,6 +41,59 @@ func block(number uint64, hash, parent string, events ...Event) Block {
 	return Block{Number: number, Hash: hash, ParentHash: parent, Events: events}
 }
 
+// genChain builds linked blocks start..end. Block n has hash prefix+itoa(n);
+// the first block's parent is parentHash. Each block mints `mint` tokens to A
+// and moves 1 token A->B->A so branches with different prefixes/amounts
+// diverge in every metric.
+func genChain(prefix string, start, end uint64, parentHash string, mint int64) []Block {
+	var out []Block
+	prev := parentHash
+	for n := start; n <= end; n++ {
+		h := prefix + uintToStr(n)
+		out = append(out, block(n, h, prev,
+			ev("TKN", Mint, "", "A", mint, n, 0),
+			ev("TKN", Transfer, "A", "B", 1, n, 1),
+			ev("TKN", Transfer, "B", "A", 1, n, 2),
+		))
+		prev = h
+	}
+	return out
+}
+
+// joinChains concatenates chain segments into one slice for reference rebuilds.
+func joinChains(segs ...[]Block) []Block {
+	var out []Block
+	for _, s := range segs {
+		out = append(out, s...)
+	}
+	return out
+}
+
+// assertWindowMatchesRef compares every snapshot queryable on e against the
+// reference for the same height, and verifies no snapshot exists below
+// lowestQueryable.
+func assertWindowMatchesRef(t *testing.T, e *Engine, ref map[uint64]Snapshot, lowestQueryable, head uint64) {
+	t.Helper()
+	for h := lowestQueryable; h <= head; h++ {
+		got, ok := e.QueryAt(h)
+		if !ok {
+			t.Fatalf("missing snapshot at height %d", h)
+		}
+		want, ok := ref[h]
+		if !ok {
+			t.Fatalf("reference missing height %d", h)
+		}
+		if !snapshotsEqual(got, want) {
+			t.Fatalf("height %d mismatch:\n got=%+v\nwant=%+v", h, got, want)
+		}
+	}
+	for h := uint64(1); h < lowestQueryable; h++ {
+		if _, ok := e.QueryAt(h); ok {
+			t.Fatalf("height %d should have been pruned", h)
+		}
+	}
+}
+
 func mustPush(t *testing.T, e *Engine, b Block) {
 	t.Helper()
 	if err := e.PushBlock(b); err != nil {

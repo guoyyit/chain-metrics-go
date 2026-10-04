@@ -46,8 +46,8 @@ func TestCheckpointRecovery(t *testing.T) {
 		}
 	}()
 
-	// WAL should retain only blocks after the latest checkpoint, i.e. fewer
-	// than one history window's worth rather than all 50 blocks.
+	// The WAL retains only blocks above the latest checkpoint image, i.e. at
+	// most one history window's worth rather than all 50 blocks.
 	walPath := filepath.Join(cfg.DataDir, walName)
 	if raw, err := os.ReadFile(walPath); err == nil {
 		lines := 0
@@ -56,8 +56,9 @@ func TestCheckpointRecovery(t *testing.T) {
 				lines++
 			}
 		}
-		if lines != 0 {
-			t.Fatalf("WAL should be empty after a tip checkpoint, got %d lines", lines)
+		if lines == 0 || lines > 2*int(cfg.HistoryBlocks) {
+			t.Fatalf("WAL should hold at most %d blocks above the image, got %d lines",
+				2*cfg.HistoryBlocks, lines)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, checkpointFile)); err != nil {
@@ -74,13 +75,16 @@ func TestCheckpointRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Recovery resumes at the last published (checkpointed) tip.
-	got, ok := e2.QueryAt(50)
-	if !ok {
-		t.Fatal("missing recovered tip snapshot 50")
-	}
-	if !snapshotsEqual(got, ref[50]) {
-		t.Fatal("checkpoint recovery mismatch at tip 50")
+	// Recovery restores the whole retained window: the checkpoint image plus
+	// the WAL replay up to the tip.
+	for h := uint64(45); h <= 50; h++ {
+		got, ok := e2.QueryAt(h)
+		if !ok {
+			t.Fatalf("missing recovered snapshot %d", h)
+		}
+		if !snapshotsEqual(got, ref[h]) {
+			t.Fatalf("checkpoint recovery mismatch at %d", h)
+		}
 	}
 
 	// Continue ingesting after recovery and verify continuity.

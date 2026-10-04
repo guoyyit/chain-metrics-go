@@ -7,7 +7,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"sort"
+	"strings"
 )
 
 const (
@@ -53,6 +53,18 @@ func OpenStore(dir string) (*Store, error) {
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
+	}
+	// Remove stale temp files left behind by a crash mid-rename. They are
+	// never referenced by any committed state.
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasPrefix(name, ".wal-") ||
+				strings.HasPrefix(name, ".head-") ||
+				strings.HasPrefix(name, ".checkpoint-") {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
+		}
 	}
 	wal, err := os.OpenFile(filepath.Join(dir, walName), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
@@ -109,8 +121,63 @@ func (s *Store) persistBlock(b Block) error {
 	return s.walWriter.Flush()
 }
 
-// truncateFrom rewrites the WAL keeping only blocks below fromHeight.
-func (s *Store) truncateFrom(fromHeight uint64) error {
+// walkChain returns the blocks reachable from headHash via parent links, in
+// ascending height order. Unreachable WAL records (stale fork branches,
+// uncommitted appends) are ignored; duplicate hashes collapse.
+func (s *Store) walkChain(headHash string) ([]Block, error) {
+	if s.dir == "" {
+		return nil, nil
+	}
+	blocks, err := s.readWAL()
+	if err != nil {
+		return nil, err
+	}
+	byHash := make(map[string]*persistedBlock, len(blocks))
+	for i := range blocks {
+		byHash[blocks[i].Hash] = &blocks[i]
+	}
+	var ordered []*persistedBlock
+	for node := byHash[headHash]; node != nil; node = byHash[node.ParentHash] {
+		ordered = append(ordered, node)
+	}
+	out := make([]Block, 0, len(ordered))
+	for i := len(ordered) - 1; i >= 0; i-- {
+		b, err := ordered[i].toBlock()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// compactWal atomically rewrites the WAL keeping only blocks that are
+// reachable from headHash via parent links AND have height above
+// aboveHeight. Blocks at or below aboveHeight are redundant because the
+// durable checkpoint image at aboveHeight covers them; unreachable blocks
+// belong to abandoned branches. Both the old and the new WAL are valid for
+// the current head, so a crash mid-compaction is harmless.
+func (s *Store) compactWal(headHash string, aboveHeight uint64) error {
+	if s.dir == "" {
+		return nil
+	}
+	blocks, err := s.readWAL()
+	if err != nil {
+		return err
+	}
+	byHash := make(map[string]*persistedBlock, len(blocks))
+	for i := range blocks {
+		byHash[blocks[i].Hash] = &blocks[i]
+	}
+	keep := make(map[string]bool)
+	for node := byHash[headHash]; node != nil && node.Number > aboveHeight; node = byHash[node.ParentHash] {
+		keep[node.Hash] = true
+	}
+	return s.rewriteWal(func(pb *persistedBlock) bool { return keep[pb.Hash] })
+}
+
+// rewriteWal atomically replaces the WAL with the records accepted by keep.
+func (s *Store) rewriteWal(keep func(*persistedBlock) bool) error {
 	if s.dir == "" {
 		return nil
 	}
@@ -131,7 +198,7 @@ func (s *Store) truncateFrom(fromHeight uint64) error {
 	}
 	w := bufio.NewWriter(tmp)
 	for _, pb := range blocks {
-		if pb.Number >= fromHeight {
+		if !keep(&pb) {
 			continue
 		}
 		raw, err := json.Marshal(pb)
@@ -249,52 +316,6 @@ func (s *Store) loadCheckpoint() ([]byte, error) {
 		return nil, nil
 	}
 	return raw, err
-}
-
-// loadCanonicalChain replays the WAL following the saved head's parent links.
-func (s *Store) loadCanonicalChain() ([]Block, error) {
-	if s.dir == "" {
-		return nil, nil
-	}
-	blocks, err := s.readWAL()
-	if err != nil {
-		return nil, err
-	}
-	byHash := make(map[string]*persistedBlock, len(blocks))
-	for i := range blocks {
-		byHash[blocks[i].Hash] = &blocks[i]
-	}
-	_, headHash, hasHead, err := s.loadHead()
-	if err != nil {
-		return nil, err
-	}
-	if !hasHead {
-		sort.Slice(blocks, func(i, j int) bool { return blocks[i].Number < blocks[j].Number })
-		out := make([]Block, 0, len(blocks))
-		for i := range blocks {
-			b, err := blocks[i].toBlock()
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, b)
-		}
-		return out, nil
-	}
-	var ordered []*persistedBlock
-	node := byHash[headHash]
-	for node != nil {
-		ordered = append(ordered, node)
-		node = byHash[node.ParentHash]
-	}
-	out := make([]Block, 0, len(ordered))
-	for i := len(ordered) - 1; i >= 0; i-- {
-		b, err := ordered[i].toBlock()
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, nil
 }
 
 // readWAL reads all durable block records; a torn trailing line is discarded.

@@ -5,8 +5,6 @@ import (
 	"math/big"
 )
 
-const checkpointName = "checkpoint.json"
-
 // cpBalance is one persisted holder balance.
 type cpBalance struct {
 	Address string

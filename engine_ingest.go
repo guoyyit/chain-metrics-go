@@ -65,10 +65,10 @@ func (e *Engine) PushBlock(b Block) error {
 	}
 	node, err := e.buildNode(b)
 	if err != nil {
-		// Parent unknown: buffer the block until its ancestor arrives.
+		// Parent unknown: reject forks that can never connect, otherwise
+		// buffer the block until its ancestor arrives.
 		if e.chain.get(b.ParentHash) == nil {
-			e.pendingBlocks[b.Hash] = b
-			return nil
+			return e.handleOrphan(b)
 		}
 		return err
 	}
@@ -87,17 +87,35 @@ func (e *Engine) PushBlock(b Block) error {
 		}
 		return e.flushPending()
 	}
-	// Otherwise it belongs to a fork (or arrived out of order); attempt a
-	// reorganization only if it connects to a known ancestor.
+	// Otherwise it belongs to a fork; attempt a reorganization only if it
+	// connects to a known ancestor.
 	if e.chain.get(b.ParentHash) != nil {
 		if err := e.maybeReorgTo(node); err != nil {
 			return err
 		}
 	} else {
-		e.pendingBlocks[b.Hash] = b
-		return nil
+		return e.handleOrphan(b)
 	}
 	return e.flushPending()
+}
+
+// handleOrphan decides the fate of a block whose parent is unknown. A block
+// whose parent sits below the retained window — or descends from an already
+// rejected fork root — can never connect, so it is rejected with
+// ErrReorgTooDeep instead of being silently buffered. Anything else is
+// buffered until its ancestor arrives.
+func (e *Engine) handleOrphan(b Block) error {
+	_, dead := e.rejectedForks[b.ParentHash]
+	if !dead && b.Number > 0 && b.Number-1 < e.floorHeight() {
+		dead = true
+	}
+	if dead {
+		e.rejectedForks[b.Hash] = b.Number
+		return fmt.Errorf("cannot accept block %s(%d): %w",
+			b.Hash, b.Number, ErrReorgTooDeep)
+	}
+	e.pendingBlocks[b.Hash] = b
+	return nil
 }
 
 // flushPending activates buffered blocks whose parents have since arrived.
@@ -126,13 +144,6 @@ func (e *Engine) flushPending() error {
 				}
 				continue
 			}
-			// The new node may now directly extend the freshly advanced tip.
-			if b.ParentHash == e.headHash && b.Number == e.headNumber+1 {
-				if err := e.activate(node); err != nil {
-					return err
-				}
-				continue
-			}
 			if err := e.maybeReorgTo(node); err != nil {
 				return err
 			}
@@ -145,6 +156,12 @@ func (e *Engine) flushPending() error {
 
 // bufferEvent stores a loose event by (height, hash, token, index).
 func (e *Engine) bufferEvent(ev Event, hash string) error {
+	// Events below the retained window can never merge into a connectable
+	// block; drop them instead of buffering forever. They cannot change any
+	// published snapshot.
+	if e.headNumber > e.cfg.HistoryBlocks && ev.Block < e.headNumber-e.cfg.HistoryBlocks {
+		return nil
+	}
 	byHash, ok := e.pending[ev.Block]
 	if !ok {
 		byHash = make(map[string]map[string]map[uint32]Event)
